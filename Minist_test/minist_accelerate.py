@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from transformers import Trainer,TrainingArguments
+import accelerate
+from accelerate import Accelerator
 
 # 下面定义一个基本网络块
 class BasicNet(nn.Module):
@@ -45,37 +47,57 @@ test_dset = datasets.MNIST('data', train=False, transform=transform)
 train_loader = torch.utils.data.DataLoader(train_dset, shuffle=True, batch_size=64)
 test_loader = torch.utils.data.DataLoader(test_dset, shuffle=False, batch_size=64)
 
-# 将模型放入CUDA设备中
 model = BasicNet()
+accelerator = Accelerator()
+device = accelerator.device
+model.to(device)
 
-training_args = TrainingArguments(
-    "basic-trainer",
-    per_device_train_batch_size=64,
-    per_device_eval_batch_size=64,
-    num_train_epochs=5,
-    evaluation_strategy="epoch",
-    remove_unused_columns=False,
-#    deepspeed="./deepspeed_config.json"
+# Build optimizer
+optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+
+# Send everything through `accelerator.prepare`
+train_loader, test_loader, model, optimizer = accelerator.prepare(
+    train_loader, test_loader, model, optimizer
 )
 
-def collate_fn(examples):
-    pixel_values = torch.stack([example[0] for example in examples])
-    labels = torch.tensor([example[1] for example in examples])
-    return {"x":pixel_values, "labels":labels}
+# Train for a single epoch
+model.train()
+for batch_idx, (data, target) in enumerate(train_loader):
+    output = model(data)
+    loss = F.nll_loss(output, target)
+    accelerator.backward(loss)
+    optimizer.step()
+    optimizer.zero_grad()
 
-class MyTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
-        outputs = model(inputs["x"])
-        target = inputs["labels"]
-        loss = F.nll_loss(outputs, target)
-        return (loss, outputs) if return_outputs else loss
 
-trainer = MyTrainer(
-    model,
-    training_args,
-    train_dataset=train_dset,
-    eval_dataset=test_dset,
-    data_collator=collate_fn,
-)
+# 在评估模式下禁用梯度计算
+total_correct = 0
+total_samples = 0
+# Evaluate
+model.eval()
+correct = 0
+with torch.no_grad():
+    for data, target in test_loader:
+        data, target = data.to(device), target.to(device)
+        output = model(data)
+        pred = output.argmax(dim=1, keepdim=True)
+        # 使用 accelerator.gather_for_metrics 收集所有设备上的预测和目标
+        all_predictions, all_targets = accelerator.gather_for_metrics((pred, target.view_as(pred)))
+        # 将收集到的预测和目标添加到指标计算中
+        correct = all_predictions.eq(all_targets).sum().item()
+        if accelerator.is_main_process:
+            # 更新总正确数和总样本数
+            total_correct += correct
+            total_samples += all_targets.size(0)
+        
 
-trainer.train()
+
+# 计算整体准确率
+if accelerator.is_main_process:
+    accuracy = 100. * total_correct/ total_samples
+    print(f"Accuracy: {accuracy:.2f}%")
+
+
+
+# # 使用 accelerator.print 打印结果
+# accelerator.print(f"Accuracy: {final_score['accuracy']:.2f}%")
